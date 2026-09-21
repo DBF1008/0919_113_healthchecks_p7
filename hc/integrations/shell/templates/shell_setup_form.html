@@ -1,0 +1,23 @@
+<div class="row">
+<div class="col-sm-6">
+    <div class="form-group">
+        <label class="control-label">Execute when a check goes <span class="label-down">down</span></label>
+        <textarea
+            class="form-control"
+            rows="3"
+            name="cmd_down"
+            placeholder='/home/user/notify.sh "$NAME has gone down"'>{{ config.cmd_down }}</textarea>
+    </div>
+</div>
+
+<div class="col-sm-6">
+    <div class="form-group">
+        <label class="control-label">Execute when a check goes <span class="label-up">up</span></label>
+        <textarea
+            class="form-control"
+            rows="3"
+            name="cmd_up"
+            placeholder='/home/user/notify.sh "$NAME is back up"'>{{ config.cmd_up }}</textarea>
+    </div>
+</div>
+</div>

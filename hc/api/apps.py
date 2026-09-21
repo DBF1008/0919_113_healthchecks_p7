@@ -13,6 +13,11 @@ from django.http.request import split_domain_port, validate_host
 class ApiConfig(AppConfig):
     name = "hc.api"
 
+    def ready(self) -> None:
+        from hc.api.models import load_plugin_transports
+
+        load_plugin_transports()
+
 
 @register()  # W001, W002, W005, E002, E003
 def settings_check(

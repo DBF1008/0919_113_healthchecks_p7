@@ -44,6 +44,11 @@ project_urls = [
     path("checks/add/", views.add_check, name="hc-add-check"),
     path("checks/status/", views.status, name="hc-status"),
     path("integrations/", views.channels, name="hc-channels"),
+    path(
+        "integrations/add/<str:kind>/",
+        views.add_plugin_channel,
+        name="hc-add-plugin-channel",
+    ),
 ]
 
 # /

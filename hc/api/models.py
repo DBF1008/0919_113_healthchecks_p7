@@ -29,6 +29,7 @@ from pydantic import BaseModel, Field
 
 from hc.accounts.models import Project
 from hc.api import transports
+from hc.api.plugins import TransportPlugin, get_plugin, registry
 from hc.lib import emails
 from hc.lib.date import month_boundaries, seconds_in_month
 from hc.lib.s3 import GetObjectError, get_object, put_object, remove_objects
@@ -44,7 +45,7 @@ MAX_DURATION = td(hours=72)
 REASONS = (("", "Unknown"), ("timeout", "Timeout"), ("fail", "Fail signal"))
 
 
-TRANSPORTS: dict[str, tuple[str, type[transports.Transport] | str]] = {
+TRANSPORTS = {
     "apprise": ("Apprise", "hc.integrations.apprise.transport.Apprise"),
     "call": ("Phone Call", "hc.integrations.call.transport.Call"),
     "discord": ("Discord", "hc.integrations.discord.transport.Discord"),
@@ -78,9 +79,29 @@ TRANSPORTS: dict[str, tuple[str, type[transports.Transport] | str]] = {
     "whatsapp": ("WhatsApp", "hc.integrations.whatsapp.transport.WhatsApp"),
     "zulip": ("Zulip", "hc.integrations.zulip.transport.Zulip"),
 }
+TRANSPORTS: dict[
+    str, tuple[str, type[transports.Transport] | type[TransportPlugin] | str]
+]
 
 
 CHANNEL_KINDS = [(kind, label_cls[0]) for kind, label_cls in TRANSPORTS.items()]
+
+
+def load_plugin_transports() -> None:
+    """Discover transport plugins and merge them into TRANSPORTS.
+
+    Plugins are discovered via the plugin registry (built-ins + the
+    "healthchecks.transports" setuptools entry points group), so new
+    integrations require no manual registration here.
+    """
+    for kind, plugin_cls in registry.all().items():
+        TRANSPORTS.setdefault(kind, (plugin_cls.label, plugin_cls))
+
+
+def get_channel_kinds() -> list[tuple[str, str]]:
+    """Channel kind choices: built-in transports plus discovered plugins."""
+    load_plugin_transports()
+    return [(kind, label) for kind, (label, _) in TRANSPORTS.items()]
 
 PO_PRIORITIES = {
     -3: "disabled",
@@ -987,8 +1008,12 @@ class Channel(models.Model):
     code = models.UUIDField(default=uuid.uuid4, editable=False, unique=True)
     project = models.ForeignKey(Project, models.CASCADE)
     created = models.DateTimeField(default=now)
-    kind = models.CharField(max_length=20, choices=CHANNEL_KINDS)
+    kind = models.CharField(max_length=20, choices=get_channel_kinds)
     value = models.TextField(blank=True)
+    # Structured configuration, validated by the kind's transport plugin.
+    # The legacy value field above is kept in sync for backwards
+    # compatibility with existing transports.
+    config_json = models.JSONField(default=dict, blank=True)
     email_verified = models.BooleanField(default=False)
     disabled = models.BooleanField(default=False)
     last_notify = models.DateTimeField(null=True, blank=True)
@@ -1037,6 +1062,59 @@ class Channel(models.Model):
         seed = str(self.code) + settings.SECRET_KEY
         seed_bytes = seed.encode()
         return hashlib.sha256(seed_bytes).hexdigest()
+
+    def __getattr__(self, name: str) -> Any:
+        # Dynamically resolve conf_<kind> attributes via the plugin
+        # registry: channel.conf_shell, channel.conf_telegram, ...
+        if name.startswith("conf_"):
+            kind = name.removeprefix("conf_")
+            plugin_cls = registry.get(kind)
+            if plugin_cls is not None:
+                return plugin_cls(self).validate_config(self.get_config())
+
+        raise AttributeError(f"{type(self).__name__!r} has no attribute {name!r}")
+
+    def get_plugin(self) -> TransportPlugin:
+        """Return the transport plugin handling this channel's kind."""
+        return get_plugin(self)
+
+    def get_config(self) -> dict[str, Any]:
+        """Return this channel's configuration as a dict.
+
+        Prefers the structured config_json field; falls back to parsing
+        the legacy value field.
+        """
+        if self.config_json:
+            return self.config_json
+        if self.value:
+            try:
+                doc = json.loads(self.value)
+            except ValueError:
+                return {}
+            if isinstance(doc, dict):
+                return doc
+        return {}
+
+    def set_config(self, data: dict[str, Any], validate: bool = True) -> None:
+        """Validate and store channel configuration.
+
+        Writes both config_json and the legacy value field (kept in sync
+        for backwards compatibility with existing transports).
+        """
+        if validate:
+            config = self.get_plugin().validate_config(data)
+            data = config.model_dump(mode="json")
+        self.config_json = data
+        self.value = json.dumps(data, sort_keys=True)
+
+    @property
+    def conf(self) -> Any:
+        """Plugin-validated configuration for this channel's own kind."""
+        return getattr(self, f"conf_{self.kind}")
+
+    def is_noop(self, status: str) -> bool:
+        """Return True if this channel ignores the given check status."""
+        return self.get_plugin().is_noop(status)
 
     def send_verify_link(self) -> None:
         args = [self.code, self.make_token()]
@@ -1101,6 +1179,7 @@ class Channel(models.Model):
 
     @property
     def transport(self) -> transports.Transport:
+        load_plugin_transports()
         if self.kind not in TRANSPORTS:
             raise NotImplementedError(f"Unknown channel kind: {self.kind}")
 
@@ -1111,10 +1190,16 @@ class Channel(models.Model):
             cls = getattr(import_module(modulename), classname)
             TRANSPORTS[self.kind] = (label, cls)
 
+        if isinstance(cls, type) and issubclass(cls, TransportPlugin):
+            raise NotImplementedError(
+                f"{self.kind} is a plugin-based transport, use get_plugin()"
+            )
+
         return cls(self)
 
     def notify(self, flip: Flip, is_test: bool = False) -> str:
-        if self.transport.is_noop(flip.new_status):
+        plugin = self.get_plugin()
+        if plugin.is_noop(flip.new_status):
             return "no-op"
 
         n = Notification(channel=self)
@@ -1131,7 +1216,14 @@ class Channel(models.Model):
 
         start, error, disabled = now(), "", self.disabled
         try:
-            self.transport.notify(flip, notification=n)
+            if plugin.is_legacy:
+                self.transport.notify(flip, notification=n)
+            else:
+                result = plugin.notify(flip)
+                if not result.success:
+                    raise transports.TransportError(
+                        result.error, permanent=result.permanent
+                    )
 
         except transports.TransportError as e:
             disabled = True if e.permanent else disabled
@@ -1367,7 +1459,7 @@ class Flip(models.Model):
 
         q = self.owner.channel_set.exclude(disabled=True)
         q = q.order_by(F("last_notify_duration").asc(nulls_last=True))
-        return [ch for ch in q if not ch.transport.is_noop(self.new_status)]
+        return [ch for ch in q if not ch.is_noop(self.new_status)]
 
     def reason_long(self) -> str | None:
         if self.reason == "timeout":

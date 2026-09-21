@@ -41,6 +41,7 @@ from oncalendar import OnCalendar, OnCalendarError
 
 from hc.accounts.http import AuthenticatedHttpRequest
 from hc.accounts.models import Member, Profile, Project
+from hc.api.plugins import registry as plugin_registry
 from hc.api.models import (
     DEFAULT_GRACE,
     DEFAULT_TIMEOUT,
@@ -1330,6 +1331,36 @@ def remove_channel(request: AuthenticatedHttpRequest, code: UUID) -> HttpRespons
 @login_required
 def edit_channel(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     channel = _get_rw_channel_for_user(request, code)
+
+    # Plugin-based integrations render and handle their own setup forms,
+    # no per-kind view functions required.
+    try:
+        plugin = channel.get_plugin()
+    except NotImplementedError:
+        plugin = None
+
+    if plugin is not None and plugin.has_setup_form():
+        if request.method == "POST":
+            try:
+                plugin.handle_setup(request, channel)
+            except (ValidationError, ValueError) as e:
+                messages.warning(request, f"Could not save settings: {e}")
+                return redirect("hc-edit-channel", channel.code)
+
+            channel.save()
+            messages.success(request, "Settings updated!")
+            return redirect("hc-channels", channel.project.code)
+
+        ctx = {
+            "page": "channels",
+            "channel": channel,
+            "plugin": plugin,
+            "setup_form_html": plugin.render_setup_form(channel),
+            "status_html": plugin.render_status(),
+        }
+
+        return render(request, "front/plugin_channel_form.html", ctx)
+
     if channel.kind == "email":
         from hc.integrations.email.views import email_form
 
@@ -1360,6 +1391,46 @@ def edit_channel(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
         return group_form(request, channel)
 
     return HttpResponseBadRequest()
+
+
+@login_required
+def add_plugin_channel(
+    request: AuthenticatedHttpRequest, code: UUID, kind: str
+) -> HttpResponse:
+    """Add a channel for a plugin-based integration.
+
+    The plugin supplies the setup form (render_setup_form) and handles
+    the submitted data (handle_setup), so new integrations do not need
+    their own view functions here.
+    """
+    project = _get_rw_project_for_user(request, code)
+    plugin_cls = plugin_registry.get(kind)
+    if plugin_cls is None:
+        raise Http404("Unknown integration")
+
+    channel = Channel(project=project, kind=kind)
+    plugin = plugin_cls(channel)
+    if not plugin.has_setup_form():
+        raise Http404("This integration does not provide a setup form")
+
+    if request.method == "POST":
+        try:
+            plugin.handle_setup(request, channel)
+        except (ValidationError, ValueError) as e:
+            messages.warning(request, f"Could not save settings: {e}")
+        else:
+            channel.save()
+            channel.assign_all_checks()
+            return redirect("hc-channels", project.code)
+
+    ctx = {
+        "page": "channels",
+        "project": project,
+        "plugin": plugin,
+        "setup_form_html": plugin.render_setup_form(),
+    }
+
+    return render(request, "front/plugin_channel_add.html", ctx)
 
 
 def log_events(request: HttpRequest, code: UUID) -> HttpResponse:

@@ -1,0 +1,28 @@
+{% extends "base_project.html" %}
+{% load compress humanize static hc_extras %}
+
+{% block title %}Edit {{ plugin.label }} - {{ site_name }}{% endblock %}
+
+{% block content %}
+<div class="row">
+    <div class="col-sm-12">
+        <h1>{{ plugin.label }}</h1>
+
+        <p>{{ status_html|safe }}</p>
+        <br />
+
+        <form id="edit-channel-form" method="post">
+        {% csrf_token %}
+
+        {{ setup_form_html|safe }}
+
+        <div class="row">
+            <div class="col-sm-12">
+                <button type="submit" class="btn btn-default">Save</button>
+                <a href="{% url 'hc-channels' channel.project.code %}" class="btn btn-link">Cancel</a>
+            </div>
+        </div>
+        </form>
+    </div>
+</div>
+{% endblock %}
