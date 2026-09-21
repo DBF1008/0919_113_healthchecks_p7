@@ -1330,36 +1330,13 @@ def remove_channel(request: AuthenticatedHttpRequest, code: UUID) -> HttpRespons
 @login_required
 def edit_channel(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     channel = _get_rw_channel_for_user(request, code)
-    if channel.kind == "email":
-        from hc.integrations.email.views import email_form
+    # Integration add/edit views are provided by the channel's transport
+    # plugin, so new integrations do not need a branch here.
+    setup_view = channel.plugin.get_setup_view()
+    if setup_view is None:
+        return HttpResponseBadRequest()
 
-        return email_form(request, channel)
-    elif channel.kind == "webhook":
-        from hc.integrations.webhook.views import webhook_form
-
-        return webhook_form(request, channel)
-    elif channel.kind == "sms":
-        from hc.integrations.sms.views import sms_form
-
-        return sms_form(request, channel)
-    elif channel.kind == "signal":
-        from hc.integrations.signal.views import signal_form
-
-        return signal_form(request, channel)
-    elif channel.kind == "whatsapp":
-        from hc.integrations.whatsapp.views import whatsapp_form
-
-        return whatsapp_form(request, channel)
-    elif channel.kind == "ntfy":
-        from hc.integrations.ntfy.views import ntfy_form
-
-        return ntfy_form(request, channel)
-    elif channel.kind == "group":
-        from hc.integrations.group.views import group_form
-
-        return group_form(request, channel)
-
-    return HttpResponseBadRequest()
+    return setup_view(request, channel)
 
 
 def log_events(request: HttpRequest, code: UUID) -> HttpResponse:

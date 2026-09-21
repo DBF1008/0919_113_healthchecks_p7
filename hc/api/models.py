@@ -29,6 +29,9 @@ from pydantic import BaseModel, Field
 
 from hc.accounts.models import Project
 from hc.api import transports
+from hc.api.plugins import TransportPlugin
+from hc.api.plugins import get_channel_kinds
+from hc.api.plugins import registry as transport_registry
 from hc.lib import emails
 from hc.lib.date import month_boundaries, seconds_in_month
 from hc.lib.s3 import GetObjectError, get_object, put_object, remove_objects
@@ -44,43 +47,50 @@ MAX_DURATION = td(hours=72)
 REASONS = (("", "Unknown"), ("timeout", "Timeout"), ("fail", "Fail signal"))
 
 
-TRANSPORTS: dict[str, tuple[str, type[transports.Transport] | str]] = {
-    "apprise": ("Apprise", "hc.integrations.apprise.transport.Apprise"),
-    "call": ("Phone Call", "hc.integrations.call.transport.Call"),
-    "discord": ("Discord", "hc.integrations.discord.transport.Discord"),
-    "email": ("Email", "hc.integrations.email.transport.Email"),
-    "github": ("GitHub", "hc.integrations.github.transport.GitHub"),
-    "googlechat": ("Google Chat", "hc.integrations.googlechat.transport.GoogleChat"),
-    "gotify": ("Gotify", "hc.integrations.gotify.transport.Gotify"),
-    "group": ("Group", "hc.integrations.group.transport.Group"),
-    "matrix": ("Matrix", "hc.integrations.matrix.transport.Matrix"),
-    "mattermost": ("Mattermost", "hc.integrations.mattermost.transport.Mattermost"),
-    "msteamsw": (
-        "Microsoft Teams",
-        "hc.integrations.msteamsw.transport.MsTeamsWorkflow",
-    ),
-    "ntfy": ("ntfy", "hc.integrations.ntfy.transport.Ntfy"),
-    "opsgenie": ("Opsgenie", "hc.integrations.opsgenie.transport.Opsgenie"),
-    "pagertree": ("PagerTree", "hc.integrations.pagertree.transport.PagerTree"),
-    "pd": ("PagerDuty", "hc.integrations.pd.transport.PagerDuty"),
-    "po": ("Pushover", "hc.integrations.po.transport.Pushover"),
-    "pushbullet": ("Pushbullet", "hc.integrations.pushbullet.transport.Pushbullet"),
-    "rocketchat": ("Rocket.Chat", "hc.integrations.rocketchat.transport.RocketChat"),
-    "shell": ("Shell Command", "hc.integrations.shell.transport.Shell"),
-    "signal": ("Signal", "hc.integrations.signal.transport.Signal"),
-    "slack": ("Slack", "hc.integrations.slack.transport.Slack"),
-    "sms": ("SMS", "hc.integrations.sms.transport.Sms"),
-    "spike": ("Spike", "hc.integrations.spike.transport.Spike"),
-    "telegram": ("Telegram", "hc.integrations.telegram.transport.Telegram"),
-    "trello": ("Trello", "hc.integrations.trello.transport.Trello"),
-    "victorops": ("Splunk On-Call", "hc.integrations.victorops.transport.VictorOps"),
-    "webhook": ("Webhook", "hc.integrations.webhook.transport.Webhook"),
-    "whatsapp": ("WhatsApp", "hc.integrations.whatsapp.transport.WhatsApp"),
-    "zulip": ("Zulip", "hc.integrations.zulip.transport.Zulip"),
-}
+class _LazyTransportsDict(dict):
+    """Backward-compatible, lazily-populated view of the plugin registry.
+
+    Transport plugins are discovered dynamically (see hc.api.plugins):
+    built-in integrations, hc/integrations/<kind>/plugin.py modules, and
+    third-party packages registered via the "healthchecks.transports"
+    entry point group. This dict only exists so that legacy code reading
+    TRANSPORTS keeps working; new code should use hc.api.plugins.registry.
+    """
+
+    _populated = False
+
+    def _ensure(self) -> None:
+        if not self._populated:
+            super().update(transport_registry.transport_map())
+            self._populated = True
+
+    def __contains__(self, key: object) -> bool:
+        self._ensure()
+        return super().__contains__(key)
+
+    def __getitem__(self, key: str) -> Any:
+        self._ensure()
+        return super().__getitem__(key)
+
+    def __iter__(self) -> Any:
+        self._ensure()
+        return super().__iter__()
+
+    def __len__(self) -> int:
+        self._ensure()
+        return super().__len__()
+
+    def items(self) -> Any:
+        self._ensure()
+        return super().items()
+
+    def get(self, key: str, default: Any = None) -> Any:
+        self._ensure()
+        return super().get(key, default)
 
 
-CHANNEL_KINDS = [(kind, label_cls[0]) for kind, label_cls in TRANSPORTS.items()]
+TRANSPORTS: dict[str, tuple[str, type[transports.Transport] | str]]
+TRANSPORTS = _LazyTransportsDict()
 
 PO_PRIORITIES = {
     -3: "disabled",
@@ -987,8 +997,14 @@ class Channel(models.Model):
     code = models.UUIDField(default=uuid.uuid4, editable=False, unique=True)
     project = models.ForeignKey(Project, models.CASCADE)
     created = models.DateTimeField(default=now)
-    kind = models.CharField(max_length=20, choices=CHANNEL_KINDS)
+    # kind references a registered TransportPlugin (see hc.api.plugins.registry);
+    # choices are resolved dynamically so new plugins need no model changes.
+    kind = models.CharField(max_length=20, choices=get_channel_kinds)
     value = models.TextField(blank=True)
+    # Structured configuration, validated by the plugin's validate_config().
+    # The legacy `value` field is kept for backwards compatibility; when
+    # config_json is empty, configuration is parsed from `value` instead.
+    config_json = models.JSONField(default=dict, blank=True)
     email_verified = models.BooleanField(default=False)
     disabled = models.BooleanField(default=False)
     last_notify = models.DateTimeField(null=True, blank=True)
@@ -1019,14 +1035,41 @@ class Channel(models.Model):
         return {"id": str(self.code), "name": self.name, "kind": self.kind}
 
     def is_editable(self) -> bool:
-        return self.kind in (
-            "email",
-            "webhook",
-            "sms",
-            "signal",
-            "whatsapp",
-            "ntfy",
-            "group",
+        return self.plugin.get_setup_view() is not None
+
+    @property
+    def plugin(self) -> TransportPlugin:
+        """Return the transport plugin handling this channel's kind."""
+        return transport_registry.get(self.kind, channel=self)
+
+    def get_config(self) -> BaseModel:
+        """Return this channel's configuration, validated by its plugin.
+
+        Prefers the structured `config_json` field; falls back to parsing
+        the legacy `value` field (JSON document or raw string).
+        """
+        if self.config_json:
+            data: Any = self.config_json
+        else:
+            try:
+                data = json.loads(self.value)
+            except ValueError:
+                data = self.value
+
+        return self.plugin.validate_config(data)
+
+    def __getattr__(self, name: str) -> Any:
+        # Dynamically resolve configuration attributes (e.g. `channel.telegram`,
+        # `channel.shell`, `channel.phone`) via the plugin registry, instead of
+        # hardcoding one @property per integration. Only called when normal
+        # attribute lookup fails, so model fields are unaffected.
+        if name.startswith("_"):
+            raise AttributeError(name)
+        attr_map = transport_registry.config_attr_map()
+        if name in attr_map and self.kind in attr_map[name]:
+            return self.get_config()
+        raise AttributeError(
+            f"{type(self).__name__!r} object has no attribute {name!r}"
         )
 
     def assign_all_checks(self) -> None:
@@ -1114,7 +1157,8 @@ class Channel(models.Model):
         return cls(self)
 
     def notify(self, flip: Flip, is_test: bool = False) -> str:
-        if self.transport.is_noop(flip.new_status):
+        plugin = self.plugin
+        if plugin.is_noop(flip.new_status):
             return "no-op"
 
         n = Notification(channel=self)
@@ -1130,12 +1174,11 @@ class Channel(models.Model):
         n.save()
 
         start, error, disabled = now(), "", self.disabled
-        try:
-            self.transport.notify(flip, notification=n)
-
-        except transports.TransportError as e:
-            disabled = True if e.permanent else disabled
-            error = e.message
+        result = plugin.notify(flip, notification=n)
+        if not result.success:
+            error = result.error
+            if result.permanent:
+                disabled = True
 
         Notification.objects.filter(id=n.id).update(error=error)
         Channel.objects.filter(id=self.id).update(
@@ -1180,11 +1223,6 @@ class Channel(models.Model):
     @property
     def up_webhook_spec(self) -> WebhookSpec:
         return self.webhook_spec("up")
-
-    @property
-    def shell(self) -> ShellConf:
-        assert self.kind == "shell"
-        return ShellConf.model_validate_json(self.value)
 
     @property
     def slack_team(self) -> str | None:
@@ -1237,11 +1275,6 @@ class Channel(models.Model):
 
         return url
 
-    @property
-    def telegram(self) -> TelegramConf:
-        assert self.kind == "telegram"
-        return TelegramConf.model_validate_json(self.value)
-
     def update_telegram_id(self, new_chat_id: int) -> None:
         doc = json.loads(self.value)
         doc["id"] = new_chat_id
@@ -1249,52 +1282,11 @@ class Channel(models.Model):
         self.save()
 
     @property
-    def pd(self) -> PdConf:
-        assert self.kind == "pd"
-        return PdConf.load(self.value)
-
-    @property
-    def phone(self) -> PhoneConf:
-        assert self.kind in ("call", "sms", "whatsapp", "signal")
-        return PhoneConf.model_validate_json(self.value)
-
-    @property
-    def trello(self) -> TrelloConf:
-        assert self.kind == "trello"
-        return TrelloConf.model_validate_json(self.value, strict=True)
-
-    @property
-    def email(self) -> EmailConf:
-        return EmailConf.load(self.value)
-
-    @property
-    def opsgenie(self) -> OpsgenieConf:
-        return OpsgenieConf.model_validate_json(self.value)
-
-    @property
-    def zulip(self) -> ZulipConf:
-        return ZulipConf.model_validate_json(self.value)
-
-    @property
-    def github(self) -> GitHubConf:
-        return GitHubConf.model_validate_json(self.value)
-
-    @property
-    def gotify(self) -> GotifyConf:
-        assert self.kind == "gotify"
-        return GotifyConf.model_validate_json(self.value, strict=True)
-
-    @property
     def group_channels(self) -> QuerySet[Channel]:
         assert self.kind == "group"
         return Channel.objects.filter(
             project=self.project, code__in=self.value.split(",")
         )
-
-    @property
-    def ntfy(self) -> NtfyConf:
-        assert self.kind == "ntfy"
-        return NtfyConf.model_validate_json(self.value, strict=True)
 
 
 class Notification(models.Model):
